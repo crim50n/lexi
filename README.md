@@ -56,7 +56,7 @@ Lexi is a Telegram chatbot that connects to various Large Language Models (LLMs)
 1. **Install Termux and required packages:**
    ```bash
    pkg update
-   pkg install python git python-pip
+   pkg install python git python-pip rust
    ```
 2. **Clone the repository:**
    ```bash
