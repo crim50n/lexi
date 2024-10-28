@@ -76,7 +76,6 @@ Lexi is a Telegram chatbot that connects to various Large Language Models (LLMs)
    ```bash
    export BOT_TOKEN="YOUR_TELEGRAM_BOT_TOKEN"
    export ADMIN_USER_ID="YOUR_TELEGRAM_USER_ID"
-   # Optional:
    export BOT_USERNAME="YOUR_BOT_USERNAME"
    ```
 6. **Run the bot:**

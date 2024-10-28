@@ -26,7 +26,7 @@ def get_available_models(host, api_key=None):
         for model_data in data.get("models", []):
             model_name = model_data.get("name")
             if model_name:
-                models.append(model_name.split("/")[-1]) # отсекаем префикс models/
+                models.append(model_name.split("/")[-1])
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching models: {e}")
     return models
