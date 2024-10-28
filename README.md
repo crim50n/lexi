@@ -1,7 +1,7 @@
 # Lexi: AI Chat Assistant for Telegram
 
 <p align="center">
-  ![Lexi Logo](lexi.jpg)
+    <img src="lexi.jpg" alt="Lexi Logo">
 </p>
 
 Lexi is a Telegram chatbot that connects to various Large Language Models (LLMs) such as OpenAI, Groq, Ollama, KoboldCpp, and Gemini. This allows you to have conversational experiences right within your Telegram app.
