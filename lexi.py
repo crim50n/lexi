@@ -3,13 +3,16 @@ import logging
 import os
 import time
 import threading
+import tiktoken
 
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
 import lexi_ai_api
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 BOT_USERNAME = os.environ.get("BOT_USERNAME")
@@ -45,11 +48,12 @@ global_system_prompt = None
 global_parse_mode = "Markdown"
 api_request_timeout = 120
 group_mode = "respond_to_mentions_only"
+max_context_tokens = 2048
 
 
 def load_data():
     global allowed_users, config, global_host, global_model, global_api_type, \
-        global_api_key, global_allow_all_users, global_system_prompt, group_mode, global_parse_mode
+        global_api_key, global_allow_all_users, global_system_prompt, group_mode, global_parse_mode, max_context_tokens
 
     allowed_users = load_json_data(USER_DATA_FILE, default={str(ADMIN_USER_ID): ADMIN_USER_ID})
     logging.info(f"Loaded allowed users: {allowed_users}")
@@ -62,7 +66,8 @@ def load_data():
         "allow_all_users": False,
         "system_prompt": None,
         "group_mode": "respond_to_mentions_only",
-        "parse_mode": "Markdown"
+        "parse_mode": "Markdown",
+        "max_context_tokens": 2048
     })
     logging.info(f"Loaded config: {config}")
 
@@ -71,6 +76,7 @@ def load_data():
     global_model = config.get("model")
     global_api_key = config.get("api_key")
     global_parse_mode = config.get("parse_mode", "Markdown")
+    max_context_tokens = config.get("max_context_tokens", 2048)
 
     if global_api_type and global_host and global_model:
         logging.info(
@@ -85,13 +91,13 @@ def load_data():
     group_mode = config.get("group_mode", "respond_to_mentions_only")
     logging.info(
         f"Allow all users: {global_allow_all_users}, System prompt: {global_system_prompt}, "
-        f"Group Mode: {group_mode}, Parse Mode: {global_parse_mode}"
+        f"Group Mode: {group_mode}, Parse Mode: {global_parse_mode}, Max context tokens: {max_context_tokens}"
     )
 
 
 def load_json_data(file_path, default=None):
     try:
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
         logging.warning(f"No {file_path} file found. Using default values.")
@@ -99,7 +105,7 @@ def load_json_data(file_path, default=None):
 
 
 def save_data(file_path, data):
-    with open(file_path, "w") as f:
+    with open(file_path, "w", encoding='utf-8') as f:
         json.dump(data, f, indent=4)
     logging.info(f"Saved data to {file_path}")
 
@@ -137,9 +143,26 @@ def check_config(chat_id):
     return True
 
 
+def count_tokens(messages, model: str) -> int:
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        logging.warning(f"Warning: model not found. Using cl100k_base encoding.")
+        encoding = tiktoken.get_encoding("cl100k_base")
+    num_tokens = 0
+    for message in messages:
+        num_tokens += 4
+        for key, value in message.items():
+            if value is not None:
+                num_tokens += len(encoding.encode(value))
+            if key == "name":
+                num_tokens -= 1
+    num_tokens += 3
+    return num_tokens
+
+
 def send_api_request(
         chat_id,
-        messages,
         reply_to_message_id=None,
         api_type=None,
         host=None,
@@ -149,30 +172,53 @@ def send_api_request(
         parse_mode=None,
         bot=None,
         typing_active=None,
-        api_request_timeout=120
+        api_request_timeout=120,
+        max_context_tokens=2048
 ):
+    global chat_contexts
+
     typing_active[chat_id] = True
     typing_thread = threading.Thread(target=send_typing_action, args=(chat_id, bot, typing_active))
     typing_thread.start()
 
     try:
+        while count_tokens(chat_contexts[chat_id], model) > max_context_tokens:
+            logging.warning(f"Context for chat {chat_id} exceeds token limit. Removing oldest messages...")
+            chat_contexts[chat_id].pop(1)
+
+        if chat_contexts[chat_id][0]["role"] == "system" and chat_contexts[chat_id][0]["content"] is None:
+            chat_contexts[chat_id] = chat_contexts[chat_id][1:]
+
         response_text = lexi_ai_api.send_api_request(
             api_type=api_type,
             host=host,
             model=model,
             api_key=api_key,
-            messages=messages,
+            messages=chat_contexts[chat_id],
             system_prompt=system_prompt,
             api_request_timeout=api_request_timeout
         )
 
         if response_text:
-            logging.info(f"Sending message to chat {chat_id}: {response_text}")
-            bot.send_message(
-                chat_id, response_text,
-                reply_to_message_id=reply_to_message_id,
-                parse_mode=parse_mode
-            )
+            chat_contexts[chat_id].append({"role": "assistant", "content": response_text})
+
+            chunks = split_into_chunks(response_text, 4096)
+
+            for index, chunk in enumerate(chunks):
+                try:
+                    bot.send_message(
+                        chat_id,
+                        chunk,
+                        reply_to_message_id=reply_to_message_id if index == 0 else None,
+                        parse_mode=parse_mode
+                    )
+                except ApiTelegramException:
+                    logging.warning(f"Error sending message with Markdown. Retrying without Markdown...")
+                    bot.send_message(
+                        chat_id,
+                        chunk,
+                        reply_to_message_id=reply_to_message_id if index == 0 else None
+                    )
         else:
             bot.send_message(chat_id, "Error: Empty response from API")
             logging.error("Empty response from API")
@@ -182,6 +228,10 @@ def send_api_request(
         logging.error(f"Error during API request: {e}")
     finally:
         typing_active[chat_id] = False
+
+
+def split_into_chunks(text, chunk_size):
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 
 @bot.message_handler(commands=["start"])
@@ -205,7 +255,8 @@ def handle_start_command(message):
                              "Please contact the administrator for access.",
                              parse_mode=global_parse_mode)
 
-    chat_contexts[chat_id] = []
+    if chat_id not in chat_contexts:
+        chat_contexts[chat_id] = [{"role": "system", "content": global_system_prompt}]
 
 
 @bot.message_handler(commands=["help"])
@@ -230,6 +281,7 @@ def handle_help_command(message):
         /useraccess - Toggle access between all users and authorized users only
         /groupmode - Choose the bot's behavior in groups
         /parsemode - Choose the message parsing mode (Markdown, HTML, None)
+        /contextlimit - Set the context size limit in tokens
         """
     else:
         help_text = """
@@ -245,7 +297,7 @@ def handle_help_command(message):
 
 @bot.message_handler(commands=['systemprompt'])
 def handle_system_prompt_command(message):
-    global global_system_prompt, config
+    global global_system_prompt, config, chat_contexts
     if message.from_user.id != ADMIN_USER_ID:
         bot.send_message(message.chat.id, "You don't have permission to use this command.")
         return
@@ -296,7 +348,7 @@ def handle_parse_mode_command(message):
 def handle_clear_context_command(message):
     global chat_contexts
     chat_id = message.chat.id
-    chat_contexts[chat_id] = []
+    chat_contexts[chat_id] = [{"role": "system", "content": global_system_prompt}]
     bot.reply_to(message, "Context cleared ")
     logging.info(f"Context cleared for chat {chat_id}")
 
@@ -353,6 +405,30 @@ def handle_group_mode_command(message):
         markup.add(types.InlineKeyboardButton(description, callback_data=f"set_group_mode_{mode}"))
 
     bot.send_message(message.chat.id, "Choose group mode:", reply_markup=markup)
+
+@bot.message_handler(commands=['contextlimit'])
+def handle_context_limit_command(message):
+    global max_context_tokens, config
+    if message.from_user.id != ADMIN_USER_ID:
+        bot.reply_to(message, "You don't have permission to use this command.")
+        return
+
+    bot.reply_to(message, "Enter the desired context size limit in tokens:")
+    bot.register_next_step_handler(message, get_context_limit)
+
+def get_context_limit(message):
+    global max_context_tokens, config
+    try:
+        new_limit = int(message.text)
+        if new_limit > 0:
+            max_context_tokens = new_limit
+            config["max_context_tokens"] = max_context_tokens
+            save_data(CONFIG_DATA_FILE, config)
+            bot.reply_to(message, f"Context size limit set to {max_context_tokens} tokens.")
+        else:
+            bot.reply_to(message, "Context size limit must be a positive integer.")
+    except ValueError:
+        bot.reply_to(message, "Invalid context size limit. Please enter an integer.")
 
 
 @bot.message_handler(commands=['timeout'])
@@ -415,6 +491,8 @@ def handle_setup_callback(call):
         save_data(CONFIG_DATA_FILE, config)
         bot.answer_callback_query(call.id, "System prompt removed.")
         logging.info("System prompt removed.")
+        for chat_id in chat_contexts:
+            chat_contexts[chat_id][0] = {"role": "system", "content": global_system_prompt}
     elif call.data == 'show_system_prompt':
         if global_system_prompt:
             bot.answer_callback_query(call.id, f"Current system prompt:\n\n{global_system_prompt}", show_alert=True)
@@ -470,7 +548,7 @@ def handle_set_group_mode_callback(call):
 
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
-    global global_host, global_model, global_api_type, chat_contexts, group_mode, global_api_key, global_parse_mode
+    global global_host, global_model, global_api_type, chat_contexts, group_mode, global_api_key, global_parse_mode, max_context_tokens
     chat_id = message.chat.id
     user_id = message.from_user.id
     message_id = message.message_id
@@ -500,12 +578,12 @@ def handle_message(message):
     user_message = message.text.replace(f'@{BOT_USERNAME}', '').strip()
 
     if chat_id not in chat_contexts:
-        chat_contexts[chat_id] = []
+        chat_contexts[chat_id] = [{"role": "system", "content": global_system_prompt}]
 
     chat_contexts[chat_id].append({"role": "user", "content": user_message})
+
     send_api_request(
         chat_id=chat_id,
-        messages=chat_contexts[chat_id],
         reply_to_message_id=message_id,
         api_type=global_api_type,
         host=global_host,
@@ -515,13 +593,14 @@ def handle_message(message):
         parse_mode=global_parse_mode,
         bot=bot,
         typing_active=typing_active,
-        api_request_timeout=api_request_timeout
+        api_request_timeout=api_request_timeout,
+        max_context_tokens=max_context_tokens
     )
 
 
 def start_setup_admin(chat_id):
     global chat_contexts
-    chat_contexts[chat_id] = []
+    chat_contexts[chat_id] = [{"role": "system", "content": global_system_prompt}]
     markup = telebot.types.InlineKeyboardMarkup()
     for api_type in lexi_ai_api.SUPPORTED_API_TYPES:
         markup.add(telebot.types.InlineKeyboardButton(api_type, callback_data=f"setapi_{api_type}"))
@@ -661,12 +740,14 @@ def get_timeout_value(message):
 
 
 def get_system_prompt_from_user(message):
-    global global_system_prompt, config
+    global global_system_prompt, config, chat_contexts
     global_system_prompt = message.text
     config["system_prompt"] = global_system_prompt
     save_data(CONFIG_DATA_FILE, config)
     bot.reply_to(message, f"System prompt set to:\n\n{global_system_prompt}")
     logging.info(f"System prompt set to: {global_system_prompt}")
+    for chat_id in chat_contexts:
+        chat_contexts[chat_id][0] = {"role": "system", "content": global_system_prompt}
 
 
 load_data()

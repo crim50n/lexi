@@ -1,10 +1,9 @@
 import requests
 import logging
-import os
 
 PLUGIN_NAME = "OpenAI"
 default_host = "https://api.openai.com"
-api_key_required = True
+api_key_required = False
 
 def is_host_available(host, api_key=None):
     url = f"{host}/v1/models"
